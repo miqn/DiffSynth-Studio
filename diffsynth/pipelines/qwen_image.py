@@ -386,7 +386,7 @@ class QwenImageUnit_PromptEmbedder(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         if pipe.text_encoder is not None:
             prompt = [prompt]
-            if edit_image is None:
+            if edit_image is None or (isinstance(edit_image, (list, tuple)) and len(edit_image) == 0):
                 split_hidden_states = self.encode_prompt(pipe, prompt)
             elif isinstance(edit_image, Image.Image):
                 split_hidden_states = self.encode_prompt_edit(pipe, prompt, edit_image)
@@ -551,7 +551,7 @@ class QwenImageUnit_EditImageEmbedder(PipelineUnit):
 
 
     def process(self, pipe: QwenImagePipeline, edit_image, tiled, tile_size, tile_stride, edit_image_auto_resize=False):
-        if edit_image is None:
+        if edit_image is None or (isinstance(edit_image, (list, tuple)) and len(edit_image) == 0):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         if isinstance(edit_image, Image.Image):
