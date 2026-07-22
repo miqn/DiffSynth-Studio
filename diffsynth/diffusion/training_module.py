@@ -355,7 +355,7 @@ class DiffusionTrainingModule(torch.nn.Module):
                     controlnet_inputs[name][extra_input.replace(prefix, "")] = data[extra_input]
                     break
             else:
-                inputs_shared[extra_input] = data[extra_input]
+                inputs_shared[extra_input] = data.get(extra_input)
         for name, params in controlnet_inputs.items():
             inputs_shared[name] = [ControlNetInput(**params)]
         return inputs_shared

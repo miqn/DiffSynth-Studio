@@ -66,7 +66,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
                 self.search_for_cached_data_files(subpath)
             elif subpath.endswith(".pth"):
                 self.cached_data.append(subpath)
-    
+
     def load_metadata(self, metadata_path):
         if metadata_path is None:
             print("No metadata_path. Searching for cached data files.")
