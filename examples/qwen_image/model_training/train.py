@@ -1,4 +1,5 @@
-import torch, os, argparse, accelerate
+import torch, os, json, argparse, accelerate
+from PIL import Image as PILImage
 from diffsynth.core import UnifiedDataset
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -23,6 +24,8 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
         device="cpu",
         task="sft",
         zero_cond_t=False,
+        mask_dir=None,
+        dataset_base_path_for_mask=None,
     ):
         super().__init__()
         # Load models
@@ -40,7 +43,7 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
-        
+
         # Other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
@@ -48,6 +51,8 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
         self.fp8_models = fp8_models
         self.task = task
         self.zero_cond_t = zero_cond_t
+        self.mask_dir = mask_dir
+        self.dataset_base_path_for_mask = dataset_base_path_for_mask
         self.task_to_loss = {
             "sft:data_process": lambda pipe, *args: args,
             "direct_distill:data_process": lambda pipe, *args: args,
@@ -85,6 +90,33 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
                 "width": data["image"].size[0],
             })
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+
+        if self.mask_dir and self.dataset_base_path_for_mask and not isinstance(data["image"], list):
+            mask_filename = data.get("mask")
+            train_w, train_h = data["image"].size
+            latent_w, latent_h = train_w // 8, train_h // 8
+            mask = torch.ones(1, 1, latent_h, latent_w)
+
+            if mask_filename:
+                mask_path = os.path.join(self.mask_dir, mask_filename)
+                if os.path.exists(mask_path):
+                    base = mask_filename.replace(".json", "")
+                    img_filename = base + "_cleaned.png"
+                    img_path = os.path.join(self.dataset_base_path_for_mask, img_filename)
+                    with PILImage.open(img_path) as img:
+                        orig_w, orig_h = img.size
+                    with open(mask_path) as f:
+                        boxes = json.load(f)
+                    for box in boxes:
+                        x1, y1, x2, y2 = box["xyxy"]
+                        lx1 = max(0, int(x1 / orig_w * latent_w))
+                        ly1 = max(0, int(y1 / orig_h * latent_h))
+                        lx2 = min(latent_w, int(x2 / orig_w * latent_w))
+                        ly2 = min(latent_h, int(y2 / orig_h * latent_h))
+                        mask[0, 0, ly1:ly2, lx1:lx2] = 0
+
+            inputs_shared["mask"] = mask
+
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None):
@@ -104,6 +136,8 @@ def qwen_image_parser():
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
     parser.add_argument("--zero_cond_t", default=False, action="store_true", help="A special parameter introduced by Qwen-Image-Edit-2511. Please enable it for this model.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--mask_dir", type=str, default=None, help="Path to directory containing mask JSON files.")
+    parser.add_argument("--dataset_base_path_for_mask", type=str, default=None, help="Base path for dataset images, used to load original image dimensions for mask generation.")
     return parser
 
 
@@ -162,6 +196,8 @@ if __name__ == "__main__":
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         zero_cond_t=args.zero_cond_t,
+        mask_dir=args.mask_dir,
+        dataset_base_path_for_mask=args.dataset_base_path_for_mask,
     )
     model_logger = ModelLogger(
         args.output_path,
