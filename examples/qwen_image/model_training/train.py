@@ -93,20 +93,18 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
 
         if self.mask_dir and self.dataset_base_path_for_mask and not isinstance(data["image"], list):
             mask_filename = data.get("mask")
-            train_w, train_h = data["image"].size
-            latent_w, latent_h = train_w // 8, train_h // 8
-            mask = torch.ones(1, 1, latent_h, latent_w)
-
             if mask_filename:
                 mask_path = os.path.join(self.mask_dir, mask_filename)
                 if os.path.exists(mask_path):
                     base = mask_filename.replace(".json", "")
-                    img_filename = base + "_cleaned.png"
-                    img_path = os.path.join(self.dataset_base_path_for_mask, img_filename)
+                    img_path = os.path.join(self.dataset_base_path_for_mask, base + ".png")
                     with PILImage.open(img_path) as img:
                         orig_w, orig_h = img.size
                     with open(mask_path) as f:
                         boxes = json.load(f)
+                    train_w, train_h = data["image"].size
+                    latent_w, latent_h = train_w // 8, train_h // 8
+                    mask = torch.ones(1, 1, latent_h, latent_w)
                     for box in boxes:
                         x1, y1, x2, y2 = box["xyxy"]
                         lx1 = max(0, int(x1 / orig_w * latent_w))
@@ -114,8 +112,8 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
                         lx2 = min(latent_w, int(x2 / orig_w * latent_w))
                         ly2 = min(latent_h, int(y2 / orig_h * latent_h))
                         mask[0, 0, ly1:ly2, lx1:lx2] = 0
-
-            inputs_shared["mask"] = mask
+                    if (mask == 0).any():
+                        inputs_shared["mask"] = mask
 
         return inputs_shared, inputs_posi, inputs_nega
     

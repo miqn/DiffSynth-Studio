@@ -1,4 +1,4 @@
-import json, os, subprocess, sys, torch
+import json, math, os, subprocess, sys, torch
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
@@ -8,8 +8,22 @@ from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
 
 
+def _round_to_multiple(value, multiple):
+    return max(multiple, int(round(value / multiple) * multiple))
+
+
+def _choose_generation_size(target_width, target_height, max_pixels, multiple):
+    width = float(max(1, target_width))
+    height = float(max(1, target_height))
+    if width * height > max_pixels:
+        ratio = width / height
+        width = math.sqrt(max_pixels * ratio)
+        height = width / ratio
+    return _round_to_multiple(width, multiple), _round_to_multiple(height, multiple)
+
+
 def _run_epoch_eval_inplace(eval_script: str, epoch_id: int, output_path: str,
-                            accelerator: Accelerator):
+                            accelerator: Accelerator, model):
     """In-place epoch eval: use the training model directly for inference.
 
     Machine 0 processes shard the benchmark and generate images in parallel
@@ -24,8 +38,10 @@ def _run_epoch_eval_inplace(eval_script: str, epoch_id: int, output_path: str,
     eval_root = os.environ.get("EVAL_OUTPUT_ROOT", "/workspace/manga_sft/eval_results")
     eval_output_dir = os.path.join(eval_root, f"epoch-{epoch_id}")
     summary_file = os.path.join(eval_root, "eval_summary.jsonl")
-    width = int(os.environ.get("EVAL_WIDTH", "768"))
-    height = int(os.environ.get("EVAL_HEIGHT", "1024"))
+    default_width = int(os.environ.get("EVAL_WIDTH", "768"))
+    default_height = int(os.environ.get("EVAL_HEIGHT", "1024"))
+    max_panel_pixels = int(os.environ.get("EVAL_MAX_PANEL_PIXELS", str(1024 * 1024)))
+    size_multiple = int(os.environ.get("EVAL_SIZE_MULTIPLE", "16"))
     num_inference_steps = int(os.environ.get("EVAL_STEPS", "40"))
     seed = int(os.environ.get("EVAL_SEED", "0"))
 
@@ -33,16 +49,22 @@ def _run_epoch_eval_inplace(eval_script: str, epoch_id: int, output_path: str,
 
     # Phase 1: inference — only machine 0, machine 1 waits at barrier
     is_machine_0 = getattr(accelerator, "node_rank", 0) == 0
-
-    with open(benchmark_path) as f:
-        all_entries = [json.loads(line) for line in f if line.strip()]
+    n_infer = 0
+    my_entries = []
 
     if is_machine_0:
-        local_procs = accelerator.num_processes // int(os.environ.get("EVAL_NUM_MACHINES", "2"))
+        num_machines = int(os.environ.get("EVAL_NUM_MACHINES", "2"))
+        if accelerator.num_processes % num_machines != 0:
+            raise ValueError(
+                f"EVAL_NUM_MACHINES={num_machines} does not evenly divide "
+                f"num_processes={accelerator.num_processes}; cannot shard benchmark."
+            )
+        local_procs = accelerator.num_processes // num_machines
         local_rank = accelerator.process_index % local_procs
+
+        with open(benchmark_path) as f:
+            all_entries = [json.loads(line) for line in f if line.strip()]
         my_entries = all_entries[local_rank::local_procs]
-    else:
-        my_entries = []
 
     if accelerator.is_main_process:
         os.makedirs(panels_dir, exist_ok=True)
@@ -53,36 +75,42 @@ def _run_epoch_eval_inplace(eval_script: str, epoch_id: int, output_path: str,
 
     # Access the pipeline from the training model (machine 0 only)
     if is_machine_0:
-        unwrapped = accelerator.unwrap_model(accelerator.models[0])
+        unwrapped = accelerator.unwrap_model(model)
         pipe = unwrapped.pipe
         pipe.eval()
 
         gen_ok, gen_fail = 0, 0
-        for entry in my_entries:
-            image_name = Path(entry["image"]).stem
-            save_path = os.path.join(panels_dir, f"{image_name}.png")
-            ref_paths = [os.path.join(dataset_base, p) for p in entry.get("edit_image", [])]
-            ref_images = []
-            for p in ref_paths:
-                if os.path.exists(p):
-                    ref_images.append(Image.open(p).convert("RGB"))
-            try:
-                with torch.no_grad():
-                    kwargs = dict(seed=seed, num_inference_steps=num_inference_steps,
-                                  height=height, width=width, zero_cond_t=True,
-                                  cfg_scale=1.0,
-                                  progress_bar_cmd=lambda x: x)
-                    if ref_images:
-                        img = pipe(entry["prompt"], edit_image=ref_images, **kwargs)
-                    else:
-                        img = pipe(entry["prompt"], **kwargs)
-                img.save(save_path)
-                gen_ok += 1
-            except Exception as e:
-                gen_fail += 1
-                print(f"[eval] {image_name} ERROR: {e}", flush=True)
+        try:
+            for entry in my_entries:
+                image_name = Path(entry["image"]).stem
+                save_path = os.path.join(panels_dir, f"{image_name}.png")
+                ref_paths = [os.path.join(dataset_base, p) for p in entry.get("edit_image", [])]
+                ref_images = []
+                for p in ref_paths:
+                    if os.path.exists(p):
+                        ref_images.append(Image.open(p).convert("RGB"))
+                try:
+                    entry_w = entry.get("width", default_width)
+                    entry_h = entry.get("height", default_height)
+                    gen_w, gen_h = _choose_generation_size(entry_w, entry_h, max_panel_pixels, size_multiple)
+                    with torch.no_grad():
+                        kwargs = dict(seed=seed, num_inference_steps=num_inference_steps,
+                                      height=gen_h, width=gen_w, zero_cond_t=True,
+                                      cfg_scale=4.0,
+                                      edit_image_auto_resize=True,
+                                      progress_bar_cmd=lambda x: x)
+                        if ref_images:
+                            img = pipe(entry["prompt"], edit_image=ref_images, **kwargs)
+                        else:
+                            img = pipe(entry["prompt"], **kwargs)
+                    img.save(save_path)
+                    gen_ok += 1
+                except Exception as e:
+                    gen_fail += 1
+                    print(f"[eval] {image_name} ERROR: {e}", flush=True)
+        finally:
+            pipe.train()
 
-        pipe.train()
         if accelerator.is_main_process:
             print(f"[eval] inference done: {gen_ok} ok, {gen_fail} fail", flush=True)
 
@@ -168,7 +196,7 @@ def launch_training_task(
             model_logger.on_epoch_end(accelerator, model, epoch_id)
             eval_script = os.environ.get("EVAL_SCRIPT")
             if eval_script:
-                _run_epoch_eval_inplace(eval_script, epoch_id, model_logger.output_path, accelerator)
+                _run_epoch_eval_inplace(eval_script, epoch_id, model_logger.output_path, accelerator, model)
 
     model_logger.on_training_end(accelerator, model, save_steps)
 
