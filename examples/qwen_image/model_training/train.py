@@ -104,13 +104,16 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
                         boxes = json.load(f)
                     train_w, train_h = data["image"].size
                     latent_w, latent_h = train_w // 8, train_h // 8
+                    scale = max(train_w / orig_w, train_h / orig_h)
+                    offset_x = (orig_w * scale - train_w) / 2
+                    offset_y = (orig_h * scale - train_h) / 2
                     mask = torch.ones(1, 1, latent_h, latent_w)
                     for box in boxes:
                         x1, y1, x2, y2 = box["xyxy"]
-                        lx1 = max(0, int(x1 / orig_w * latent_w))
-                        ly1 = max(0, int(y1 / orig_h * latent_h))
-                        lx2 = min(latent_w, int(x2 / orig_w * latent_w))
-                        ly2 = min(latent_h, int(y2 / orig_h * latent_h))
+                        lx1 = max(0, int((x1 * scale - offset_x) / 8))
+                        ly1 = max(0, int((y1 * scale - offset_y) / 8))
+                        lx2 = min(latent_w, int((x2 * scale - offset_x) / 8))
+                        ly2 = min(latent_h, int((y2 * scale - offset_y) / 8))
                         mask[0, 0, ly1:ly2, lx1:lx2] = 0
                     if (mask == 0).any():
                         inputs_shared["mask"] = mask
